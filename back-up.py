@@ -42,7 +42,55 @@ MBTI_COLORS = {
 # Supabase 설정
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
-supabase = create_client(SUPABASE_URL, SUPABASE_KEY) if SUPABASE_URL and SUPABASE_KEY else None
+
+# 디버깅: 환경 변수 확인
+if not SUPABASE_URL:
+    print("⚠️ SUPABASE_URL이 설정되지 않았습니다.")
+if not SUPABASE_KEY:
+    print("⚠️ SUPABASE_KEY가 설정되지 않았습니다.")
+
+try:
+    supabase = create_client(SUPABASE_URL, SUPABASE_KEY) if SUPABASE_URL and SUPABASE_KEY else None
+    if supabase:
+        print("✅ Supabase 클라이언트가 성공적으로 생성되었습니다.")
+        # 테이블 존재 여부 확인 및 생성
+        try:
+            # responses 테이블 확인
+            supabase.table("responses").select("id").limit(1).execute()
+            print("✅ responses 테이블이 존재합니다.")
+            
+            # location 컬럼 확인 및 자동 추가
+            try:
+                supabase.table("responses").select("location").limit(1).execute()
+                print("✅ location 컬럼이 존재합니다.")
+            except Exception as location_error:
+                if "location" in str(location_error).lower():
+                    print("⚠️ location 컬럼이 없습니다. 자동으로 추가를 시도합니다...")
+                    try:
+                        # RPC를 통해 컬럼 추가 시도
+                        supabase.rpc('add_location_column').execute()
+                        print("✅ location 컬럼이 성공적으로 추가되었습니다.")
+                    except Exception as add_error:
+                        print(f"❌ 자동 컬럼 추가 실패: {add_error}")
+                        print("수동으로 다음 SQL을 실행해주세요:")
+                        print("ALTER TABLE public.responses ADD COLUMN location TEXT DEFAULT '일반';")
+                else:
+                    print(f"⚠️ location 컬럼 확인 중 오류: {location_error}")
+                    
+        except Exception as e:
+            print(f"⚠️ responses 테이블 확인 중 오류: {e}")
+            
+        try:
+            # user_robots 테이블 확인
+            supabase.table("user_robots").select("id").limit(1).execute()
+            print("✅ user_robots 테이블이 존재합니다.")
+        except Exception as e:
+            print(f"⚠️ user_robots 테이블 확인 중 오류: {e}")
+    else:
+        print("❌ Supabase 클라이언트 생성에 실패했습니다.")
+except Exception as e:
+    print(f"❌ Supabase 클라이언트 생성 중 오류: {e}")
+    supabase = None
 
 # 세션 상태 초기화
 def init_session_state():
@@ -408,6 +456,10 @@ def check_admin_login(username, password):
 def save_response(user_id, responses, mbti, scores, profile, robot_id):
     """응답 데이터 저장 (보안 강화)"""
     try:
+        if not supabase:
+            st.error("데이터베이스 연결이 없습니다.")
+            return False
+            
         # 입력값 정제
         user_id = sanitize_input(user_id)
         robot_id = sanitize_input(robot_id)
@@ -424,6 +476,7 @@ def save_response(user_id, responses, mbti, scores, profile, robot_id):
             st.error(f"로봇 ID 오류: {robot_msg}")
             return False
         
+        # 기본 레코드 구성
         record = {
             "user_id": user_id,
             "gender": profile["gender"],
@@ -433,11 +486,24 @@ def save_response(user_id, responses, mbti, scores, profile, robot_id):
             "responses": responses,
             "mbti": mbti,
             "scores": scores,
-            "location": st.session_state.get('selected_location', '일반'),  # 장소 정보 추가
             "timestamp": datetime.now(pytz.timezone("Asia/Seoul")).isoformat()
         }
-        supabase.table("responses").insert(record).execute()
-        return True
+        
+        # location 컬럼이 있는지 확인하고 추가
+        try:
+            # 먼저 location 컬럼 없이 테스트 쿼리
+            test_record = record.copy()
+            test_record["location"] = st.session_state.get('selected_location', '일반')
+            supabase.table("responses").insert(test_record).execute()
+            return True
+        except Exception as location_error:
+            # location 컬럼이 없는 경우, location 없이 저장 시도
+            if "location" in str(location_error).lower():
+                # location 컬럼이 없는 경우 조용히 처리 (경고 메시지 제거)
+                supabase.table("responses").insert(record).execute()
+                return True
+            else:
+                raise location_error
     except Exception as e:
         st.error(f"응답 저장 실패: {e}")
         return False
@@ -445,6 +511,10 @@ def save_response(user_id, responses, mbti, scores, profile, robot_id):
 def load_responses():
     """모든 응답 데이터 로드"""
     try:
+        if not supabase:
+            st.error("데이터베이스 연결이 없습니다.")
+            return pd.DataFrame()
+            
         res = supabase.table("responses").select("*").execute()
         return pd.DataFrame(res.data) if res.data else pd.DataFrame()
     except Exception as e:
@@ -517,6 +587,9 @@ def delete_user_data(user_id):
 def load_user_robots(user_id):
     """사용자의 로봇 목록 로드"""
     try:
+        if not supabase:
+            return []
+            
         res = supabase.table("user_robots").select("*").eq("user_id", user_id).execute()
         return [robot['robot_name'] for robot in res.data] if res.data else []
     except Exception as e:
@@ -544,13 +617,18 @@ def save_robot(user_id, robot_name, robot_description=""):
         
         # 중복 로봇 확인
         try:
-            existing = supabase.table("user_robots").select("robot_name").eq("user_id", user_id).eq("robot_name", robot_name).execute()
-            if existing.data:
-                st.warning(f"이미 등록된 로봇입니다: {robot_name}")
-                return False
+            if supabase:
+                existing = supabase.table("user_robots").select("robot_name").eq("user_id", user_id).eq("robot_name", robot_name).execute()
+                if existing.data:
+                    st.warning(f"이미 등록된 로봇입니다: {robot_name}")
+                    return False
         except Exception as e:
             st.info(f"중복 확인 중 오류 (무시됨): {e}")
         
+        if not supabase:
+            st.error("데이터베이스 연결이 없습니다.")
+            return False
+            
         record = {
             "user_id": user_id,
             "robot_name": robot_name,
@@ -1767,6 +1845,10 @@ def save_response_with_session(diagnosis_data):
             st.error(f"로봇 ID 오류: {robot_msg}")
             return False
         
+        if not supabase:
+            st.error("데이터베이스 연결이 없습니다.")
+            return False
+            
         # diagnosis_session_id가 있으면 중복 확인, 없으면 기본 저장
         if "diagnosis_session_id" in diagnosis_data:
             try:
@@ -1779,7 +1861,7 @@ def save_response_with_session(diagnosis_data):
                 # diagnosis_session_id 컬럼이 없는 경우 무시하고 계속 진행
                 st.info("진단 세션 ID 기능이 비활성화되어 있습니다.")
         
-        # diagnosis_session_id 제거하고 기본 필드만 저장
+        # 기본 저장 데이터 구성
         save_data = {
             "user_id": diagnosis_data["user_id"],
             "gender": diagnosis_data["gender"],
@@ -1789,12 +1871,24 @@ def save_response_with_session(diagnosis_data):
             "responses": diagnosis_data["responses"],
             "mbti": diagnosis_data["mbti"],
             "scores": diagnosis_data["scores"],
-            "location": diagnosis_data.get("location", "일반"),  # 장소 정보 추가
             "timestamp": diagnosis_data["timestamp"]
         }
         
-        supabase.table("responses").insert(save_data).execute()
-        return True
+        # location 컬럼이 있는지 확인하고 추가
+        try:
+            # 먼저 location 컬럼 포함해서 저장 시도
+            save_data_with_location = save_data.copy()
+            save_data_with_location["location"] = diagnosis_data.get("location", "일반")
+            supabase.table("responses").insert(save_data_with_location).execute()
+            return True
+        except Exception as location_error:
+            # location 컬럼이 없는 경우, location 없이 저장 시도
+            if "location" in str(location_error).lower():
+                st.warning("데이터베이스에 location 컬럼이 없습니다. location 정보 없이 저장합니다.")
+                supabase.table("responses").insert(save_data).execute()
+                return True
+            else:
+                raise location_error
     except Exception as e:
         st.error(f"응답 저장 실패: {e}")
         return False
@@ -1979,7 +2073,8 @@ def show_robot_management():
             if st.button("🗑️ 삭제"):
                 try:
                     # 데이터베이스에서 삭제 시도
-                    supabase.table("user_robots").delete().eq("user_id", st.session_state.user_id).eq("robot_name", delete_robot).execute()
+                    if supabase:
+                        supabase.table("user_robots").delete().eq("user_id", st.session_state.user_id).eq("robot_name", delete_robot).execute()
                     robot_opts.remove(delete_robot)
                     st.session_state.robot_list = robot_opts
                     if st.session_state.robot_id == delete_robot:
@@ -3333,3 +3428,186 @@ def show_admin_data_management(df):
 if __name__ == "__main__":
     show_sidebar()
     show_main_content()
+
+#로컬 데이터 저장소 초기화
+def init_local_storage():
+    """로컬 데이터 저장소 초기화"""
+    if 'local_data' not in st.session_state:
+        st.session_state.local_data = []
+    if 'local_user_robots' not in st.session_state:
+        st.session_state.local_user_robots = {}
+
+# 데이터베이스 함수들
+def save_to_database(user_id, robot_id, mbti_result, responses, location, user_profile):
+    """진단 결과를 데이터베이스 또는 로컬 저장소에 저장"""
+    # 진단 세션 ID 생성
+    diagnosis_session_id = f"{user_id}_{robot_id}_{int(time.time())}"
+    
+    if supabase:
+        try:
+            # 응답 데이터 저장
+            for question_id, response_data in responses.items():
+                data = {
+                    'user_id': sanitize_input(user_id),
+                    'robot_id': sanitize_input(robot_id),
+                    'question_id': question_id,
+                    'question_text': response_data['question'],
+                    'response_score': response_data['score'],
+                    'mbti_dimension': response_data['dimension'],
+                    'mbti_result': mbti_result,
+                    'location': location,
+                    'gender': user_profile.get('gender', ''),
+                    'age_group': user_profile.get('age_group', ''),
+                    'job': user_profile.get('job', ''),
+                    'diagnosis_session_id': diagnosis_session_id,
+                    'created_at': datetime.now(pytz.UTC).isoformat()
+                }
+                
+                result = supabase.table('responses').insert(data).execute()
+                
+            st.session_state.current_diagnosis_id = diagnosis_session_id
+            return True, "진단 결과가 성공적으로 저장되었습니다."
+            
+        except Exception as e:
+            return False, f"데이터베이스 저장 중 오류가 발생했습니다: {str(e)}"
+    else:
+        # 로컬 저장소에 저장
+        try:
+            init_local_storage()
+            
+            # 응답 데이터를 로컬에 저장
+            for question_id, response_data in responses.items():
+                data = {
+                    'user_id': sanitize_input(user_id),
+                    'robot_id': sanitize_input(robot_id),
+                    'question_id': question_id,
+                    'question_text': response_data['question'],
+                    'response_score': response_data['score'],
+                    'mbti_dimension': response_data['dimension'],
+                    'mbti_result': mbti_result,
+                    'location': location,
+                    'gender': user_profile.get('gender', ''),
+                    'age_group': user_profile.get('age_group', ''),
+                    'job': user_profile.get('job', ''),
+                    'diagnosis_session_id': diagnosis_session_id,
+                    'created_at': datetime.now(pytz.UTC).isoformat()
+                }
+                
+                st.session_state.local_data.append(data)
+            
+            st.session_state.current_diagnosis_id = diagnosis_session_id
+            return True, "진단 결과가 로컬에 저장되었습니다. (데이터베이스 미연결)"
+            
+        except Exception as e:
+            return False, f"로컬 저장 중 오류가 발생했습니다: {str(e)}"
+
+def check_recent_diagnosis(user_id, robot_id, hours=24):
+    """최근 진단 이력 확인"""
+    if supabase:
+        try:
+            cutoff_time = datetime.now(pytz.UTC) - timedelta(hours=hours)
+            
+            result = supabase.table('responses').select('*').eq('user_id', user_id).eq('robot_id', robot_id).gte('created_at', cutoff_time.isoformat()).execute()
+            
+            return len(result.data) > 0
+            
+        except Exception as e:
+            st.error(f"진단 이력 확인 중 오류: {str(e)}")
+            return False
+    else:
+        # 로컬 데이터에서 확인
+        try:
+            init_local_storage()
+            cutoff_time = datetime.now(pytz.UTC) - timedelta(hours=hours)
+            
+            for data in st.session_state.local_data:
+                if (data['user_id'] == user_id and 
+                    data['robot_id'] == robot_id and 
+                    datetime.fromisoformat(data['created_at'].replace('Z', '+00:00')) > cutoff_time):
+                    return True
+            return False
+            
+        except Exception as e:
+            st.error(f"로컬 진단 이력 확인 중 오류: {str(e)}")
+            return False
+
+def load_data_from_database():
+    """데이터베이스 또는 로컬 저장소에서 데이터 로드"""
+    if supabase:
+        try:
+            result = supabase.table('responses').select('*').execute()
+            if result.data:
+                df = pd.DataFrame(result.data)
+                df['created_at'] = pd.to_datetime(df['created_at'])
+                return df
+            return pd.DataFrame()
+        except Exception as e:
+            st.error(f"데이터 로드 중 오류: {str(e)}")
+            return pd.DataFrame()
+    else:
+        # 로컬 데이터 로드
+        try:
+            init_local_storage()
+            if st.session_state.local_data:
+                df = pd.DataFrame(st.session_state.local_data)
+                df['created_at'] = pd.to_datetime(df['created_at'])
+                return df
+            return pd.DataFrame()
+        except Exception as e:
+            st.error(f"로컬 데이터 로드 중 오류: {str(e)}")
+            return pd.DataFrame()
+
+def get_user_robots(user_id):
+    """사용자의 로봇 목록 조회"""
+    if supabase:
+        try:
+            result = supabase.table('user_robots').select('robot_name').eq('user_id', user_id).execute()
+            if result.data:
+                return [robot['robot_name'] for robot in result.data]
+            return []
+        except Exception as e:
+            st.error(f"로봇 목록 조회 중 오류: {str(e)}")
+            return []
+    else:
+        # 로컬에서 로봇 목록 조회
+        try:
+            init_local_storage()
+            if user_id in st.session_state.local_user_robots:
+                return st.session_state.local_user_robots[user_id]
+            return []
+        except Exception as e:
+            st.error(f"로컬 로봇 목록 조회 중 오류: {str(e)}")
+            return []
+
+def add_user_robot(user_id, robot_name, robot_description=""):
+    """사용자 로봇 추가"""
+    if supabase:
+        try:
+            data = {
+                'user_id': sanitize_input(user_id),
+                'robot_name': sanitize_input(robot_name),
+                'robot_description': sanitize_input(robot_description),
+                'created_at': datetime.now(pytz.UTC).isoformat()
+            }
+            
+            result = supabase.table('user_robots').insert(data).execute()
+            return True, "로봇이 성공적으로 등록되었습니다."
+            
+        except Exception as e:
+            return False, f"로봇 등록 중 오류가 발생했습니다: {str(e)}"
+    else:
+        # 로컬에 로봇 추가
+        try:
+            init_local_storage()
+            
+            if user_id not in st.session_state.local_user_robots:
+                st.session_state.local_user_robots[user_id] = []
+            
+            if robot_name not in st.session_state.local_user_robots[user_id]:
+                st.session_state.local_user_robots[user_id].append(robot_name)
+                return True, "로봇이 로컬에 등록되었습니다. (데이터베이스 미연결)"
+            else:
+                return False, "이미 등록된 로봇입니다."
+                
+        except Exception as e:
+            return False, f"로컬 로봇 등록 중 오류가 발생했습니다: {str(e)}"
